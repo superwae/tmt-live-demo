@@ -493,6 +493,14 @@ html[lang="ar"] .tag{letter-spacing:0}
 .bar-primary.green{background:var(--success)}
 .bar-primary.ghost{background:var(--surface-2);color:var(--ink);border:1.5px solid var(--border-strong)}
 .cz-bar-note{margin:6px auto 0;text-align:center;font-size:12.5px;color:var(--muted);line-height:1.35}
+.chat{display:flex;flex-direction:column;gap:9px}
+.bub{max-width:86%;padding:11px 14px;border-radius:16px;background:var(--surface-2);font-size:15.5px;line-height:1.4;align-self:flex-start}
+.bub.me{align-self:flex-end;background:var(--primary);color:#fff;border-radius:16px 16px 4px 16px}
+html[dir="rtl"] .bub.me{border-radius:16px 16px 16px 4px}
+.chat-in{display:flex;gap:8px;margin-top:4px}
+.chat-in input{flex:1;min-width:0;border:1.5px solid var(--border-strong);border-radius:12px;padding:12px 13px;font-size:16px;background:var(--surface);color:var(--ink)}
+.chat-send{border:0;border-radius:12px;padding:0 18px;font-weight:800;font-size:16px;background:var(--primary);color:#fff;cursor:pointer}
+.sos-status{gap:12px}
 .crew-card{display:grid;gap:10px;padding:16px;border-radius:16px;border:2px solid var(--primary);background:var(--surface)}
 .crew-card .lbl{font-size:12.5px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;color:var(--primary)}
 html[lang="ar"] .crew-card .lbl{letter-spacing:0}
@@ -1017,7 +1025,7 @@ function triage(c) {
   hist(c, "triaged", MODEL);
   logAudit(MODEL, { en: "Scored", ar: "تقييم آلي" }, "#" + c.ref, { en: SEV_LABEL[c.ai.sev].en + " · " + c.ai.score + "/100 · " + c.ai.conf + "% sure", ar: SEV_LABEL[c.ai.sev].ar + " · " + c.ai.score + "/100 · ثقة " + c.ai.conf + "%" });
   if (c.source !== "channel") {
-    const d = S.cases.find(o => o !== c && o.source !== "channel" && o.kind === c.kind && isOpen(o) && !o.dupOf && km(o, c) < 0.6 && Math.abs(o.createdAt - c.createdAt) < 15 * 60000);
+    const d = findDup(c);
     if (d) { c.dupOf = d.id; logAudit(MODEL, { en: "Possible duplicate", ar: "احتمال تكرار" }, "#" + c.ref, { en: "Same type within 600 m of #" + d.ref, ar: "نفس النوع ضمن 600 م من #" + d.ref }); }
     if (c.ai.sev === "critical") notify(T("Critical report: {k} in {a}", { k: L(KINDS[c.kind]), a: L(AREAS[c.area]) }), "crit");
   } else {
@@ -1303,31 +1311,78 @@ function setSvc(k, on) {
 }
 
 /* ---------------- citizen phone ---------------- */
-function citizenSubmit(viaQueue) {
-  const d = S.phone.draft, me = S.phone.me;
+/* One tap sends the SOS at once (location + medical profile, if consented). The follow-up
+   questions come after, and every answer updates the report already in the operations room. */
+function deriveReport(d) {
   const kind = d.kind || "other";
-  const ans = buildAnswers(d);
-  let rating = 3; if (d.out === "no") rating++; if (d.hurt === "yes") rating++; if (d.extras.includes("notbreathing")) rating = 5; if (d.hurt === "no" && d.out !== "no") rating = 2;
+  let rating = 3; if (d.out === "no") rating++; if (d.hurt === "yes") rating++; if (d.extras.includes("notbreathing")) rating = 5; if (d.hurt === "no" && d.out === "yes") rating = 2;
   rating = clamp(rating, 1, 5);
   const ps = d.out === "no" ? "trapped" : d.hurt === "yes" ? "injured" : "evacuate";
-  const payload = { source: "app", kind, area: me.area, rating, ps, text: ans, answers: ans, title: flowTitle(d, kind), reporter: me.name, identified: true, profile: S.phone.consent.medical ? me.profile : null, consentLoc: S.phone.consent.location, mine: true };
-  S.phone.draft = newDraft();
+  const ans = buildAnswers(d), any = !!ans.en;
+  return {
+    kind, rating, ps,
+    text: any ? ans : { en: "SOS sent with one tap. Location and medical profile attached; details to follow.", ar: "استغاثة أُرسلت بنقرة واحدة. الموقع والملف الطبي مرفقان؛ التفاصيل لاحقًا." },
+    answers: any ? ans : null,
+    title: any ? flowTitle(d, kind) : { en: "SOS: details to follow", ar: "استغاثة: التفاصيل لاحقًا" },
+  };
+}
+function citizenSubmit() {
+  const me = S.phone.me, d = newDraft();
+  const payload = Object.assign({ source: "app", area: me.area, reporter: me.name, identified: true, profile: S.phone.consent.medical ? me.profile : null, consentLoc: S.phone.consent.location, mine: true, d }, deriveReport(d));
+  S.phone.screen = "sent";
   if (!S.svc.phoneNet) {
     const q = { qid: "Q" + (++seq), payload, t: simNow, ref: refCode() };
-    S.phone.queue.push(q); S.phone.screen = "queue";
+    S.phone.queue.push(q); S.phone.view = q.qid;
     logAudit("Citizen app (offline)", { en: "Report queued on the phone", ar: "حُفظ البلاغ على الهاتف" }, q.ref, { en: "Will send when online", ar: "سيُرسل عند عودة الاتصال" });
     dirty = true; return null;
   }
-  const c = makeCase(payload); intake(c);
-  S.phone.mine.unshift(c.id); S.phone.view = c.id; S.phone.screen = "sent";
+  const c = makeCase(payload); c.d = d; intake(c);
+  S.phone.mine.unshift(c.id); S.phone.view = c.id;
   dirty = true; return c;
 }
+function followTarget() {
+  const v = S.phone.view; if (!v) return null;
+  if (v[0] === "Q") { const q = S.phone.queue.find(x => x.qid === v); return q ? { d: q.payload.d, q } : null; }
+  const c = S.cases.find(x => x.id === v); return c && c.d ? { d: c.d, c } : null;
+}
+const FOLLOW = ["kind", "hurt", "many", "out", "extras"];
+function nextFollow(d) { for (const k of FOLLOW) { if (k === "many" && d.hurt !== "yes") continue; if (k === "extras" ? !d.extrasDone : !d[k]) return k; } return null; }
+function citizenAnswer(k, v) {
+  const t = followTarget(); if (!t) return;
+  const d = t.d;
+  if (k === "extras") d.extras = d.extras.includes(v) ? d.extras.filter(x => x !== v) : d.extras.concat(v);
+  else if (k === "done") d.extrasDone = true;
+  else if (k === "note") d.text = (d.text ? d.text + ". " : "") + v;
+  else d[k] = v;
+  const f = deriveReport(d);
+  if (t.q) { Object.assign(t.q.payload, f); dirty = true; return; }
+  const c = t.c;
+  Object.assign(c, { kind: f.kind, rating: f.rating, ps: f.ps, text: f.text, answers: f.answers, title: f.title });
+  if (k === "extras" || k === "done") { dirty = true; if (k === "extras") return; }
+  if (c.ai && !c.unscored && isOpen(c)) {
+    const was = c.ai.sev; c.ai = score(c);
+    if (!c.dupOf && c.state !== "merged") { const dd = findDup(c); if (dd) c.dupOf = dd.id; }
+    if (c.ai.sev === "critical" && was !== "critical" && needsDecision(c)) notify(T("Critical report: {k} in {a}", { k: L(KINDS[c.kind]), a: L(AREAS[c.area]) }), "crit");
+  }
+  hist(c, "details", "Citizen app");
+  logAudit("Citizen app", { en: "Citizen added details", ar: "أضاف المواطن تفاصيل" }, "#" + c.ref, k === "note" ? { en: "Message: " + v, ar: "رسالة: " + v } : f.title);
+  S.ui.flashId = c.id; dirty = true;
+}
+function citizenCancel() {
+  const t = followTarget(); if (!t) return;
+  if (t.q) { S.phone.queue = S.phone.queue.filter(x => x !== t.q); S.phone.view = null; S.phone.screen = "home"; toast(T("Cancelled. It will not be sent.")); dirty = true; return; }
+  const c = t.c;
+  if (["dispatched", "onscene"].includes(c.state)) { c.citizenSafe = true; hist(c, "details", "Citizen app"); logAudit("Citizen app", { en: "Citizen reports they are safe", ar: "المواطن يبلّغ أنه بأمان" }, "#" + c.ref, { en: "Team already on the way; crew informed", ar: "الفريق في الطريق؛ تم إبلاغ الطاقم" }); notify(T("#{r}: the citizen says they are safe now. The crew has been told.", { r: c.ref }), "warn"); }
+  else if (["new", "triaged", "escalated", "acknowledged"].includes(c.state)) { falseAlarm(c, { en: "Cancelled by the citizen: safe now", ar: "ألغاه المواطن: بأمان الآن" }, "Citizen app"); notify(T("#{r} was cancelled by the citizen: safe now.", { r: c.ref }), "info"); }
+  dirty = true;
+}
+function findDup(c) { return S.cases.find(o => o !== c && o.source !== "channel" && o.kind === c.kind && c.kind !== "other" && isOpen(o) && !o.dupOf && km(o, c) < 0.6 && Math.abs(o.createdAt - c.createdAt) < 15 * 60000); }
 function flushQueue() {
   const q = S.phone.queue.splice(0);
   for (const it of q) {
     // FR-DEG-05: sent once, with the reference created offline, so no duplicate
-    const c = makeCase(it.payload); c.ref = it.ref; c.createdAt = it.t; c.history[0].t = it.t; c.queuedFor = simNow - it.t; intake(c);
-    S.phone.mine.unshift(c.id); S.phone.view = c.id;
+    const c = makeCase(it.payload); c.d = it.payload.d; c.ref = it.ref; c.createdAt = it.t; c.history[0].t = it.t; c.queuedFor = simNow - it.t; intake(c);
+    S.phone.mine.unshift(c.id); if (S.phone.view === it.qid || !S.phone.view) S.phone.view = c.id;
   }
   if (q.length) { toast(T("{n} queued report(s) sent from the phone. No duplicates created.", { n: q.length })); if (S.phone.screen === "queue") S.phone.screen = "sent"; }
 }
@@ -2098,8 +2153,8 @@ function citizenApp() {
   const myOpen = P.mine.map(id => S.cases.find(c => c.id === id)).filter(Boolean);
   if (sc === "home") {
     return phoneTop() + `<main class="cz-main">
-      <div class="sos-hero"><button class="sos-big" data-act="sos" data-tour="sosbtn"><span class="sos-ring"></span><b>SOS</b><span>${T("Report an emergency")}</span></button>
-      <p class="cz-lede sos-help">${T("Two taps send a report. You can add more afterwards, or nothing at all.")}</p></div>
+      <div class="sos-hero"><button class="sos-big" data-act="sos" data-tour="sosbtn"><span class="sos-ring"></span><b>SOS</b><span>${T("Tap to send SOS now")}</span></button>
+      <p class="cz-lede sos-help">${S.phone.consent.medical ? T("One tap sends your location and medical profile to responders.") : T("One tap sends your location to responders.")}</p></div>
       ${!S.svc.phoneNet ? stateBlock("offline", "wifioff", T("You are offline"), T("No internet. Reports wait on your phone and send by themselves when you are back online.")) : ""}
       <div class="links">
       ${myOpen.length ? linkCard("pview", myOpen[0].id, "check", T("My report") + " #" + myOpen[0].ref, esc(citizenStatus(myOpen[0]))) : ""}
@@ -2109,9 +2164,18 @@ function citizenApp() {
       ${linkCard("pscreen", "consent", "shield", T("What you share"), T("Change any of your choices"))}
       </div></main>` + callBar();
   }
-  if (sc === "sos") return sosFlow();
   if (sc === "sent") {
-    const c = S.cases.find(x => x.id === P.view); if (!c) { P.screen = "home"; return citizenApp(); }
+    const v = P.view;
+    if (v && v[0] === "Q") {
+      const q = P.queue.find(x => x.qid === v); if (!q) { P.screen = "home"; return citizenApp(); }
+      return phoneTop("home") + `<main class="cz-main">
+        <section class="panel sos-status" data-tour="sosstatus"><div class="row" style="gap:14px;flex-wrap:nowrap"><span class="status-icon queued">${icon("clock", 28, 2.4)}</span><div><b style="font-size:18px">${T("SOS saved on your phone")}</b><div class="cz-note" style="color:var(--muted)">${T("No internet. It sends by itself the moment you are back online.")}</div></div></div><div class="refcard"><span>${T("Reference")}</span><b>${q.ref}</b></div></section>
+        ${followChat(q.payload.d)}
+        <button class="bar-primary ghost" style="min-height:50px;font-size:16px" data-act="sosCancel">${T("Cancel SOS — I am safe now")}</button>
+        <div class="links">${linkCard("pscreen", "sms", "msg", T("Report by text message"), T("Works without internet"))}</div>
+      </main>` + callBar();
+    }
+    const c = S.cases.find(x => x.id === v); if (!c) { P.screen = "home"; return citizenApp(); }
     const main = c.state === "merged" ? S.cases.find(x => x.id === c.mergedInto) || c : c;
     const at = {}; main.history.forEach(h => { if (!at[h.to]) at[h.to] = h.t; });
     const u = main.units.map(unit).find(x => x.caseId === main.id && x.move && x.move.phase === "scene");
@@ -2124,11 +2188,14 @@ function citizenApp() {
       [T("Closed"), at.resolved || at.closed, !!(at.resolved || at.closed)],
     ];
     const g = GUIDE[main.kind] || GUIDE.other;
+    const cancelled = c.state === "false";
     return phoneTop("home") + `<main class="cz-main">
-      <div class="status-head"><span class="status-icon">${icon("check", 30, 2.6)}</span><h1 class="cz-h1" style="font-size:26px">${c.source === "sms" ? T("Your text message was received") : T("Your report has been sent")}</h1>
-      <p class="cz-lede">${main.state === "false" ? T("An operator reviewed it and closed it.") : T("The crisis centre has it. Stay where you are if it is safe.")}</p></div>
+      <section class="panel sos-status" data-tour="sosstatus"><div class="row" style="gap:14px;flex-wrap:nowrap"><span class="status-icon ${cancelled ? "queued" : ""}">${icon(cancelled ? "info" : "check", 28, 2.6)}</span><div><b style="font-size:18px">${cancelled ? T("SOS cancelled") : c.source === "sms" ? T("Your text message was received") : T("SOS sent")}</b><div class="cz-note" style="color:var(--muted)">${cancelled ? T("An operator reviewed it and closed it.") : `${T("Priority score")}: <b style="color:var(--ink)">${c.ai ? c.ai.score : "…"}</b> · ${T("Status")}: ${esc(citizenStatus(c))}`}</div></div></div>
       <div class="refcard"><span>${T("Reference")}</span><b>${c.ref}</b></div>
+      ${!c.consentLoc ? `<div class="state degraded"><span class="si">${icon("pin", 18)}</span><div><b>${T("Only your area was shared, not your exact location.")}</b></div></div>` : ""}</section>
       ${c !== main ? stateBlock("ok", "info", T("Joined to another report"), T("Others reported the same emergency. Your report was joined to theirs so one team handles it.")) : ""}
+      ${c.d && !cancelled ? followChat(c.d) : ""}
+      ${["new", "triaged", "escalated", "acknowledged", "dispatched", "onscene"].includes(c.state) && !c.citizenSafe ? `<button class="bar-primary ghost" style="min-height:50px;font-size:16px" data-act="sosCancel">${T("Cancel SOS — I am safe now")}</button>` : c.citizenSafe ? stateBlock("ok", "check", T("The team knows you are safe."), "") : ""}
       <section class="panel"><h2>${T("What has happened")}</h2><ol class="timeline">${steps.map(s => `<li class="${s[2] ? "done" : ""}"><span class="tm">${s[2] ? icon("check", 15, 3) : "<i></i>"}</span><span><span class="tl">${s[0]}</span><span class="tmeta">${s[1] ? hm(s[1]) : s[2] ? "" : T("Not yet")}${s[3] ? " · " + esc(s[3]) : ""}</span></span></li>`).join("")}</ol></section>
       <section class="panel"><h2>${T("While you wait")}</h2><ul class="plain">${g[LANG].map(x => `<li>${esc(x)}</li>`).join("")}</ul></section>
     </main>` + callBar();
@@ -2181,22 +2248,26 @@ function citizenStatus(c) {
   const m = c.state === "merged" ? S.cases.find(x => x.id === c.mergedInto) || c : c;
   return { new: T("Received by the centre"), triaged: T("Received by the centre"), escalated: T("Received by the centre"), acknowledged: T("Seen by an operator"), dispatched: T("A team is on the way"), onscene: T("The team arrived"), resolved: T("Closed"), closed: T("Closed"), false: T("Closed") }[m.state] || "";
 }
-function sosFlow() {
-  const d = S.phone.draft;
-  const steps = ["kind", "hurt", "many", "out", "extras", "send"];
-  const st = steps[d.step];
-  const tile = (field, v, label, ic) => `<button class="choice ${d[field] === v ? "sel" : ""}" data-act="ans" data-k="${field}" data-v="${v}">${d[field] === v ? `<span class="cm">${icon("check", 13, 3.2)}</span>` : ""}${ic ? `<span class="ci">${icon(ic, 34, 1.8)}</span>` : ""}<span class="cl">${esc(label)}</span></button>`;
-  let body = "";
-  if (st === "kind") body = `<h1 class="cz-h1">${T("What is happening?")}</h1><div class="choices">${["fire", "collapse", "medical", "flood", "road", "chemical", "other"].map(k => tile("kind", k, L(KINDS[k]), k)).join("")}</div>`;
-  if (st === "hurt") body = `<h1 class="cz-h1">${T("Is anyone hurt?")}</h1><div class="choices one">${tile("hurt", "yes", T("Yes"))}${tile("hurt", "no", T("No"))}${tile("hurt", "unsure", T("Not sure"))}</div>`;
-  if (st === "many") body = `<h1 class="cz-h1">${T("Roughly how many are hurt?")}</h1><div class="choices one">${tile("many", "one", "1")}${tile("many", "few", T("2 to 5"))}${tile("many", "more", T("More than 5"))}</div>`;
-  if (st === "out") body = `<h1 class="cz-h1">${T("Can you get out?")}</h1><div class="choices one">${tile("out", "yes", T("Yes"))}${tile("out", "no", T("No, I am stuck"))}${tile("out", "unsure", T("Not sure"))}</div>`;
-  if (st === "extras") body = `<h1 class="cz-h1">${T("Anything responders should know?")}</h1><div class="chips">${Object.entries(EXTRAS).map(([k, v]) => `<button class="chipbtn ${d.extras.includes(k) ? "on" : ""}" data-act="extra" data-v="${k}">${d.extras.includes(k) ? icon("check", 15, 3) : ""}${esc(L(v))}</button>`).join("")}</div><label class="cz-field" for="sostext">${T("Anything else (optional)")}<textarea id="sostext" rows="2" data-change="sostext">${esc(d.text)}</textarea></label><button class="bar-primary ghost" style="min-height:52px;font-size:16px" data-act="sosnext">${T("Next")}</button>`;
-  if (st === "send") body = `<h1 class="cz-h1">${T("Ready to send")}</h1><section class="panel" style="font-size:15px">${esc(L(buildAnswers(d))) || T("Only that you need help.")}</section>
-     <div class="consent ${S.phone.consent.location ? "granted" : "refused"}"><div class="consent-h"><span class="li">${icon("pin", 20)}</span><b>${T("Share my exact location")}</b></div><div class="consent-choice"><button class="consent-btn allow ${S.phone.consent.location ? "sel" : ""}" data-act="consentset" data-k="location" data-v="1">${T("Allow")}</button><button class="consent-btn deny ${!S.phone.consent.location ? "sel" : ""}" data-act="consentset" data-k="location" data-v="0">${T("Don't allow")}</button></div></div>
-     <div class="consent ${S.phone.consent.medical ? "granted" : "refused"}"><div class="consent-h"><span class="li">${icon("heart", 20)}</span><b>${T("Share my medical profile")}</b></div><div class="consent-choice"><button class="consent-btn allow ${S.phone.consent.medical ? "sel" : ""}" data-act="consentset" data-k="medical" data-v="1">${T("Allow")}</button><button class="consent-btn deny ${!S.phone.consent.medical ? "sel" : ""}" data-act="consentset" data-k="medical" data-v="0">${T("Don't allow")}</button></div></div>`;
-  return phoneTop("home") + `<main class="cz-main"><div class="intake-bar"><i style="width:${(d.step + 1) / steps.length * 100}%"></i></div>${body}<p class="cz-note cz-center">${T("You can send at any point. Everything after this is optional.")}</p></main>`
-    + callBar(`<button class="bar-primary" data-act="sendnow" data-tour="sendnow">${S.svc.phoneNet ? T("Send now") : T("Save and send when online")}</button>`);
+/* Follow-up after the SOS is already sent: one question at a time, every answer reaches the team. */
+function followChat(d) {
+  const Q = {
+    kind: [T("What is happening?"), ["fire", "collapse", "medical", "flood", "road", "chemical", "other"].map(k => [k, L(KINDS[k]), k])],
+    hurt: [T("Is anyone hurt?"), [["yes", T("Yes")], ["no", T("No")], ["unsure", T("Not sure")]]],
+    many: [T("Roughly how many are hurt?"), [["one", "1"], ["few", T("2 to 5")], ["more", T("More than 5")]]],
+    out: [T("Can you move to a safe place?"), [["yes", T("Yes")], ["no", T("No, I am stuck")], ["unsure", T("Not sure")]]],
+  };
+  const label = (k, v) => (Q[k][1].find(o => o[0] === v) || [, v])[1];
+  let html = "";
+  for (const k of ["kind", "hurt", "many", "out"]) { if (!d[k]) continue; html += `<div class="bub">${esc(Q[k][0])}</div><div class="bub me">${esc(label(k, d[k]))}</div>`; }
+  if (d.extrasDone) html += `<div class="bub">${T("Anything responders should know?")}</div><div class="bub me">${d.extras.length ? d.extras.map(x => esc(L(EXTRAS[x]))).join(", ") : T("Nothing else")}</div>`;
+  if (d.text) html += `<div class="bub me">${esc(d.text)}</div>`;
+  const nk = nextFollow(d);
+  let ask = "";
+  if (nk && nk !== "extras") ask = `<div class="bub">${esc(Q[nk][0])}</div><div class="chips">${Q[nk][1].map(o => `<button class="chipbtn" data-act="ans" data-k="${nk}" data-v="${o[0]}">${o[2] ? icon(o[2], 17) : ""}${esc(o[1])}</button>`).join("")}</div>`;
+  else if (nk === "extras") ask = `<div class="bub">${T("Anything responders should know?")}</div><div class="chips">${Object.entries(EXTRAS).map(([k, v]) => `<button class="chipbtn ${d.extras.includes(k) ? "on" : ""}" data-act="extra" data-v="${k}">${d.extras.includes(k) ? icon("check", 15, 3) : ""}${esc(L(v))}</button>`).join("")}</div><button class="chipbtn" style="align-self:flex-start;border-color:var(--primary);color:var(--primary)" data-act="sosnext">${T("Done")}</button>`;
+  else ask = `<div class="bub">${T("Thank you. The team can see everything you added. You can still send a message.")}</div>`;
+  return `<section class="panel chat-card" data-tour="followup"><h2>${T("Follow-up — your answers reach the rescue team")}</h2><div class="chat">${html}${ask}</div>
+    <form class="chat-in" data-submit="chat"><label class="sr" for="chatmsg">${T("Type a message")}</label><input id="chatmsg" placeholder="${esc(T("Type a message"))}" autocomplete="off"><button class="chat-send" type="submit">${T("Send")}</button></form></section>`;
 }
 function crewApp() {
   const u = unit(CREW_UNIT), c = S.cases.find(o => o.id === u.caseId);
@@ -2252,7 +2323,7 @@ function modalBody(m) {
     return `<h2>${T("Send in a case")}</h2><p class="muted" style="margin:0">${T("It arrives exactly as a real one would: intake, AI scoring, then a person decides.")}</p><div class="scen">${opts.map(o => `<button data-act="doinject" data-v="${o[0]}"><b>${esc(o[1])}</b><span>${esc(o[2])}</span></button>`).join("")}</div><div class="mfoot"><button class="btn" data-act="closemodal">${T("Close")}</button></div>`;
   }
   if (t === "bell") return `<h2>${T("Notifications")}</h2><div class="feed" style="max-height:60vh">${S.notes.length ? S.notes.map(n => `<div><i style="background:${n.kind === "crit" ? "var(--danger)" : n.kind === "warn" ? "var(--sev-medium)" : "var(--primary)"}"></i><span>${esc(n.text)}</span><time>${clock(n.t)}</time></div>`).join("") : `<p class="muted">${T("No notifications yet.")}</p>`}</div><div class="mfoot"><button class="btn" data-act="closemodal">${T("Close")}</button></div>`;
-  if (t === "detail") { const c = S.cases.find(x => x.id === m.id); return `<h2>#${c.ref} · ${esc(L(KINDS[c.kind]))}</h2><p style="margin:0">${esc(c.title ? L(c.title) : L(c.text))}</p>${lifecycle(c)}<div class="tblwrap"><table class="tbl"><thead><tr><th>${T("Time")}</th><th>${T("Change")}</th><th>${T("By")}</th></tr></thead><tbody>${c.history.map(h => { const p = h.to.split(":"); const lab = p[0] === "unit" ? `${p[1]} · ${L(UNIT_STATUS[p[2]] || { en: p[2] === "done" ? "Finished" : p[2] === "rejected" ? "Rejected the task" : p[2], ar: p[2] === "done" ? "أنهت المهمة" : p[2] === "rejected" ? "رفضت المهمة" : p[2] })}` : h.to === "released" ? T("Released to citizens") : L(STATE_LABEL[h.to]); return `<tr><td class="num mono">${clock(h.t)}</td><td>${esc(lab)}</td><td>${esc(trActor(h.by))}</td></tr>`; }).join("")}</tbody></table></div><div class="mfoot"><button class="btn" data-act="closemodal">${T("Close")}</button></div>`; }
+  if (t === "detail") { const c = S.cases.find(x => x.id === m.id); return `<h2>#${c.ref} · ${esc(L(KINDS[c.kind]))}</h2><p style="margin:0">${esc(c.title ? L(c.title) : L(c.text))}</p>${lifecycle(c)}<div class="tblwrap"><table class="tbl"><thead><tr><th>${T("Time")}</th><th>${T("Change")}</th><th>${T("By")}</th></tr></thead><tbody>${c.history.map(h => { const p = h.to.split(":"); const lab = p[0] === "unit" ? `${p[1]} · ${L(UNIT_STATUS[p[2]] || { en: p[2] === "done" ? "Finished" : p[2] === "rejected" ? "Rejected the task" : p[2], ar: p[2] === "done" ? "أنهت المهمة" : p[2] === "rejected" ? "رفضت المهمة" : p[2] })}` : h.to === "released" ? T("Released to citizens") : h.to === "details" ? T("Citizen added details") : L(STATE_LABEL[h.to]); return `<tr><td class="num mono">${clock(h.t)}</td><td>${esc(lab)}</td><td>${esc(trActor(h.by))}</td></tr>`; }).join("")}</tbody></table></div><div class="mfoot"><button class="btn" data-act="closemodal">${T("Close")}</button></div>`; }
   if (t === "dispatch") {
     const c = S.cases.find(x => x.id === m.id), ranked = rankUnits(c);
     if (!m.sel) m.sel = suggestUnits(c);
@@ -2390,10 +2461,10 @@ function toast(text, cls = "") {
 const C = id => S.cases.find(c => c.id === id);
 const SCEN = [
   { id: "sos", tag: { en: "W1 + W2 · 12 steps", ar: "W1 + W2 · 12 خطوة" }, title: { en: "Fire in Al-Bireh: from SOS to closure", ar: "حريق في البيرة: من الاستغاثة إلى الإغلاق" }, desc: { en: "Citizen SOS, AI triage, duplicate merge, dispatch, crew app, hospital pre-alert, audit.", ar: "استغاثة مواطنة، فرز آلي، دمج بلاغ مكرر، إرسال، تطبيق الطاقم، إشعار المستشفى، التدقيق." }, steps: [
-    { f: "phone", c: { en: "Rana lives in Al-Bireh. A fire starts in her building. She opens TMT and presses SOS.", ar: "تعيش رنا في البيرة. يندلع حريق في مبناها. تفتح تطبيق TMT وتضغط زر الاستغاثة." }, run() { S.phone.mode = "citizen"; S.phone.screen = "home"; S.page = "dashboard"; }, hl: '[data-tour="sosbtn"]' },
-    { f: "phone", c: { en: "Two taps are enough. She picks Fire, says she cannot get out, and adds heavy smoke and children with her. Every question after the first is optional.", ar: "تكفي نقرتان. تختار حريق، وتقول إنها لا تستطيع الخروج، وتضيف دخانًا كثيفًا وأن معها أطفالًا. كل الأسئلة بعد الأول اختيارية." }, run() { S.phone.screen = "sos"; Object.assign(S.phone.draft, { kind: "fire", hurt: "unsure", out: "no", extras: ["smoke", "kids"], step: 4 }); }, hl: '[data-tour="sendnow"]' },
-    { f: "phone", c: { en: "She sends it and gets a reference number at once. Her location and medical profile go with it because she chose to share them.", ar: "ترسله وتحصل فورًا على رقم مرجعي. يُرسل موقعها وملفها الطبي معه لأنها اختارت مشاركتهما." }, run(x) { const c = citizenSubmit(); x.rana = c.id; S.page = "triage"; S.ui.triageView = "open"; }, hl: "#screen .refcard" },
-    { f: "console", c: { en: "Seconds later it is in the operations room. The self-hosted AI rates it Critical and shows exactly why. It only advises: nothing has happened yet.", ar: "بعد ثوانٍ يصل إلى غرفة العمليات. يقيّمه الذكاء الاصطناعي المستضاف محليًا كحالة حرجة ويبيّن السبب بالضبط. إنه يقدّم المشورة فقط: لم يحدث شيء بعد." }, run(x) { const c = C(x.rana); if (c.state === "new") triage(c); S.ui.expanded[c.id] = true; S.page = "triage"; }, hl: (x) => `[data-tour="case-${x.rana}"] .ai-box` },
+    { f: "phone", c: { en: "Rana lives in Al-Bireh. A fire starts in her building. She opens TMT and taps SOS once.", ar: "تعيش رنا في البيرة. يندلع حريق في مبناها. تفتح تطبيق TMT وتنقر زر الاستغاثة مرة واحدة." }, run() { S.phone.mode = "citizen"; S.phone.screen = "home"; S.page = "dashboard"; }, hl: '[data-tour="sosbtn"]' },
+    { f: "phone", c: { en: "One tap is enough. The SOS is sent at once with her location and medical profile, because she chose to share them, and she gets a reference number.", ar: "نقرة واحدة تكفي. تُرسل الاستغاثة فورًا مع موقعها وملفها الطبي لأنها اختارت مشاركتهما، وتحصل على رقم مرجعي." }, run(x) { const c = citizenSubmit(); x.rana = c.id; S.page = "triage"; S.ui.triageView = "open"; }, hl: '#screen [data-tour="sosstatus"]' },
+    { f: "phone", c: { en: "Then the app asks a few quick questions. Each answer updates the report already in the operations room: Fire, she cannot get out, heavy smoke, children with her.", ar: "ثم يطرح التطبيق بضعة أسئلة سريعة. كل إجابة تحدّث البلاغ الموجود أصلًا في غرفة العمليات: حريق، لا تستطيع الخروج، دخان كثيف، ومعها أطفال." }, run(x) { const c = C(x.rana); if (c.state === "new") triage(c); citizenAnswer("kind", "fire"); citizenAnswer("hurt", "unsure"); citizenAnswer("out", "no"); citizenAnswer("extras", "smoke"); citizenAnswer("extras", "kids"); citizenAnswer("done", 1); }, hl: '#screen [data-tour="followup"]' },
+    { f: "console", c: { en: "In the operations room the report has been updating with every answer. The self-hosted AI now rates it Critical and shows exactly why. It only advises: nothing has happened yet.", ar: "بعد ثوانٍ يصل إلى غرفة العمليات. يقيّمه الذكاء الاصطناعي المستضاف محليًا كحالة حرجة ويبيّن السبب بالضبط. إنه يقدّم المشورة فقط: لم يحدث شيء بعد." }, run(x) { const c = C(x.rana); if (c.state === "new") triage(c); S.ui.expanded[c.id] = true; S.page = "triage"; }, hl: (x) => `[data-tour="case-${x.rana}"] .ai-box` },
     { f: "console", c: { en: "A neighbour reports the same fire. TMT spots the likely duplicate, so the room does not send two crews to one building.", ar: "يبلّغ جار عن الحريق نفسه. يرصد TMT التكرار المحتمل، فلا تُرسل غرفة العمليات فريقين إلى المبنى نفسه." }, run(x) { const r = C(x.rana); S.ui.expanded[r.id] = false; const n = makeCase({ source: "app", kind: "fire", area: "bireh", pos: { lat: r.lat + 0.0011, lng: r.lng - 0.0006 }, rating: 4, ps: "evacuate", text: { en: SOS_T[0].en, ar: SOS_T[0].ar }, reporter: "Ahmad Hamdan", identified: true }); x.nb = n.id; triage(n); }, hl: (x) => `[data-tour="dup-${x.nb}"]` },
     { f: "phone", c: { en: "The coordinator merges the two and acknowledges Rana's report. On her phone: seen by an operator.", ar: "تدمج المنسقة البلاغين وتعتمد بلاغ رنا. على هاتفها: شاهده مشغّل." }, run(x) { mergeInto(C(x.nb)); ack(C(x.rana), actor()); S.phone.screen = "sent"; S.phone.view = x.rana; }, hl: "#screen .timeline" },
     { f: "console", c: { en: "Dispatch. TMT proposes the nearest fire engine and ambulance, and a receiving hospital with a free ICU bed. Arab Care Hospital is greyed out: its figures are stale.", ar: "الإرسال. يقترح TMT أقرب سيارة إطفاء وإسعاف، ومستشفى مستقبِلًا فيه سرير عناية مركزة شاغر. مستشفى الرعاية العربية معطّل لأن أرقامه قديمة." }, run(x) { S.phone.mode = "crew"; openModal({ type: "dispatch", id: x.rana, sel: ["FIRE-1", CREW_UNIT], wide: true }); }, hl: '[data-tour="confirmdisp"]' },
@@ -2433,7 +2504,7 @@ const SCEN = [
   ] },
   { id: "off", tag: { en: "Degraded mode · 6 steps", ar: "وضع التدهور · 6 خطوات" }, title: { en: "No internet", ar: "لا يوجد إنترنت" }, desc: { en: "Reports wait on the phone, SMS to 1090, the AI tier goes down, and everything recovers without duplicates.", ar: "البلاغات تنتظر على الهاتف، رسالة إلى 1090، توقف طبقة الذكاء الاصطناعي، ثم يتعافى كل شيء دون تكرار." }, steps: [
     { f: "phone", c: { en: "Mobile data drops out in Kafr Aqab. Huda's father has chest pain. The app tells her plainly what still works.", ar: "ينقطع الإنترنت في كفر عقب. والد هدى يعاني ألمًا في الصدر. يخبرها التطبيق بوضوح بما زال يعمل." }, run() { S.phone.me = { name: "Huda Qasem", area: "kafraqab", profile: PROFILES[5] }; S.phone.mode = "citizen"; S.phone.screen = "home"; setSvc("phoneNet", false); S.page = "status"; }, hl: "#screen .state.offline" },
-    { f: "phone", c: { en: "She presses SOS anyway. The report is saved on the phone and marked as waiting to send. Nothing is lost.", ar: "تضغط زر الاستغاثة على أي حال. يُحفظ البلاغ على الهاتف ويُعلَّم بانتظار الإرسال. لا يضيع شيء." }, run() { Object.assign(S.phone.draft, { kind: "medical", hurt: "yes", many: "one", out: "yes", extras: [], text: T("My father has chest pain and is sweating a lot.") }); citizenSubmit(); }, hl: '[data-tour="queued"]' },
+    { f: "phone", c: { en: "She taps SOS anyway. The report is saved on her phone and marked as waiting to send, and she can still answer the follow-up questions. Nothing is lost.", ar: "تنقر زر الاستغاثة على أي حال. يُحفظ البلاغ على هاتفها ويُعلَّم بانتظار الإرسال، ويمكنها مع ذلك الإجابة عن أسئلة المتابعة. لا يضيع شيء." }, run() { citizenSubmit(); citizenAnswer("kind", "medical"); citizenAnswer("hurt", "yes"); citizenAnswer("many", "one"); citizenAnswer("out", "yes"); citizenAnswer("done", 1); citizenAnswer("note", T("My father has chest pain and is sweating a lot.")); }, hl: '#screen [data-tour="sosstatus"]' },
     { f: "console", c: { en: "She also texts 1090, which needs no internet. The SMS reaches the operations room with less detail and only an area, so its confidence is lower and a person reviews it.", ar: "ترسل أيضًا رسالة نصية إلى 1090 لا تحتاج إنترنت. تصل الرسالة إلى غرفة العمليات بتفاصيل أقل وبالمنطقة فقط، فتكون الثقة أقل ويراجعها شخص." }, run(x) { S.phone.sms = "SOS CHEST PAIN KAFR AQAB FATHER 70"; sendSms(); x.sms = S.phone.view; S.page = "triage"; S.ui.triageView = "open"; S.ui.expanded[x.sms] = true; triage(C(x.sms)); }, hl: (x) => `[data-tour="case-${x.sms}"]` },
     { f: "console", c: { en: "Now the AI tier goes down too. The console says so, and a new report from Qalandia arrives unscored at the top of the queue for a person to triage.", ar: "الآن تتوقف طبقة الذكاء الاصطناعي أيضًا. تُظهر لوحة التحكم ذلك، ويصل بلاغ جديد من قلنديا غير مقيَّم إلى أعلى القائمة ليفرزه شخص." }, run(x) { setSvc("ai", false); const c = makeCase({ source: "app", kind: "road", area: "qalandia", rating: 3, ps: "injured", text: { en: SOS_T[5].en, ar: SOS_T[5].ar }, reporter: "Hani Rizeq", identified: true }); intake(c); x.q = c.id; S.ui.expanded[x.sms] = false; }, hl: '[data-tour="svc"]' },
     { f: "console", c: { en: "Services return. Unscored reports are scored automatically, and Huda's queued report sends itself once, with its original reference. TMT spots that it matches her SMS.", ar: "تعود الخدمات. تُقيَّم البلاغات غير المقيّمة تلقائيًا، ويُرسل بلاغ هدى المحفوظ نفسه مرة واحدة برقمه المرجعي الأصلي. ويرصد TMT أنه يطابق رسالتها النصية." }, run(x) { setSvc("ai", true); setSvc("phoneNet", true); S.cases.filter(c => c.state === "new" && !c.ai).forEach(triage); S.page = "triage"; }, hl: ".dup" },
@@ -2575,11 +2646,11 @@ const ACT = {
   pmode: el => { S.phone.mode = el.dataset.v; },
   pscreen: el => { S.phone.screen = el.dataset.v; if (el.dataset.v === "home") S.phone.draft = newDraft(); },
   pview: el => { S.phone.view = el.dataset.v; S.phone.screen = "sent"; },
-  sos: () => { S.phone.draft = newDraft(); S.phone.screen = "sos"; },
-  ans: el => { const d = S.phone.draft, k = el.dataset.k; d[k] = el.dataset.v; const steps = ["kind", "hurt", "many", "out", "extras", "send"]; let n = steps.indexOf(k) + 1; if (steps[n] === "many" && d.hurt !== "yes") n++; d.step = n; },
-  extra: el => { const d = S.phone.draft, k = el.dataset.v; d.extras = d.extras.includes(k) ? d.extras.filter(x => x !== k) : d.extras.concat(k); },
-  sosnext: () => { S.phone.draft.step = 5; },
-  sendnow: () => citizenSubmit(),
+  sos: () => { citizenSubmit(); },
+  sosCancel: () => citizenCancel(),
+  ans: el => citizenAnswer(el.dataset.k, el.dataset.v),
+  extra: el => citizenAnswer("extras", el.dataset.v),
+  sosnext: () => citizenAnswer("done", 1),
   call: () => toast(T("In the real app this dials 102 directly. Nothing is dialled in the demo.")),
   feedf: el => { S.phone.feedFilter = el.dataset.v; },
   unqueue: el => { S.phone.queue = S.phone.queue.filter(q => q.qid !== el.dataset.v); toast(T("Cancelled. It will not be sent.")); },
@@ -2648,7 +2719,7 @@ document.addEventListener("input", e => {
   if (el.dataset.change === "mv" && el.tagName === "TEXTAREA") S.modal[el.dataset.k] = el.value;
   if (el.dataset.change === "md" && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) { S.modal.d[el.dataset.k] = el.value; if (S.modal.type === "quick") { const errs = validateQuick(fac(S.modal.id), S.modal.d); el.classList.toggle("err", !!errs[el.dataset.k]); const b = $('[data-act="confirmquick"]'); if (b) b.disabled = Object.keys(errs).length > 0; } }
 });
-document.addEventListener("submit", e => { const f = e.target.closest("[data-submit]"); if (!f) return; e.preventDefault(); if (f.dataset.submit === "match") { $$("input,select", f).forEach(i => { if (i.dataset.k) S.ui.match[i.dataset.k] = i.value; }); S.ui.match.ran = true; document.activeElement?.blur(); dirty = true; } });
+document.addEventListener("submit", e => { const f = e.target.closest("[data-submit]"); if (!f) return; e.preventDefault(); if (f.dataset.submit === "chat") { const i = $("#chatmsg"); const v = (i && i.value || "").trim(); if (v) { citizenAnswer("note", v); i.value = ""; } i && i.blur(); dirty = true; return; } if (f.dataset.submit === "match") { $$("input,select", f).forEach(i => { if (i.dataset.k) S.ui.match[i.dataset.k] = i.value; }); S.ui.match.ran = true; document.activeElement?.blur(); dirty = true; } });
 document.addEventListener("keydown", e => { if (e.key === "Escape" && S.modal) { closeModal(); } });
 $("#modal").addEventListener("click", e => { if (e.target.id === "modal") closeModal(); });
 
@@ -3412,7 +3483,26 @@ Object.assign(AR, {
 "simple, explainable baselines, so every screen and safeguard can be tested end to end. They make no accuracy claim. Larger models are candidates and are only switched on after they pass an evaluation on Palestinian data.": "خطوط أساس بسيطة وقابلة للتفسير، كي تُختبر كل شاشة وكل ضمانة من البداية للنهاية. ولا تدّعي أي دقة. النماذج الأكبر مرشحة ولا تُفعَّل إلا بعد اجتياز تقييم على بيانات فلسطينية.",
 "{n} units on task — click a unit on the map to follow it.": "{n} وحدات في مهام — انقر على وحدة في الخريطة لمتابعتها.",
 "Patients": "المرضى",
-"Dispatch": "الإرسال"
+"Dispatch": "الإرسال",
+"#{r} was cancelled by the citizen: safe now.": "ألغى المواطن البلاغ #{r}: بأمان الآن.",
+"#{r}: the citizen says they are safe now. The crew has been told.": "#{r}: يقول المواطن إنه بأمان الآن. تم إبلاغ الطاقم.",
+"Can you move to a safe place?": "هل تستطيع الانتقال إلى مكان آمن؟",
+"Cancel SOS — I am safe now": "إلغاء الاستغاثة — أنا بأمان الآن",
+"Citizen added details": "أضاف المواطن تفاصيل",
+"Follow-up — your answers reach the rescue team": "متابعة — إجاباتك تصل إلى فريق الإنقاذ",
+"No internet. It sends by itself the moment you are back online.": "لا يوجد إنترنت. ستُرسل تلقائيًا فور عودة الاتصال.",
+"Nothing else": "لا شيء آخر",
+"One tap sends your location and medical profile to responders.": "نقرة واحدة ترسل موقعك وملفك الطبي إلى المسعفين.",
+"One tap sends your location to responders.": "نقرة واحدة ترسل موقعك إلى المسعفين.",
+"Only your area was shared, not your exact location.": "تمت مشاركة منطقتك فقط، لا موقعك الدقيق.",
+"SOS cancelled": "أُلغيت الاستغاثة",
+"SOS saved on your phone": "حُفظت الاستغاثة على هاتفك",
+"SOS sent": "أُرسلت الاستغاثة",
+"Send": "إرسال",
+"Tap to send SOS now": "انقر لإرسال استغاثة الآن",
+"Thank you. The team can see everything you added. You can still send a message.": "شكرًا لك. يرى الفريق كل ما أضفته. يمكنك مع ذلك إرسال رسالة.",
+"The team knows you are safe.": "يعرف الفريق أنك بأمان.",
+"Type a message": "اكتب رسالة"
 });
 </script>
 
